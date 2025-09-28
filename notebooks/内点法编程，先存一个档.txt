@@ -1,0 +1,795 @@
+import numpy as np
+from scipy.sparse import lil_matrix, vstack, diags,eye,bmat,linalg
+from scipy.sparse.linalg import spsolve
+#参数设置
+a = np.array([0.12, 0.17, 0.15, 0.19])
+b = np.array([14.8, 16.57, 15.55, 16.21])
+c = np.array([89, 83, 100, 70])
+max_iter = 50  #迭代次数
+
+eta_c = 0.95
+eta_d = 0.9
+SOC_ini = 100
+SOC_max = 300
+SOC_min = 60
+Pc_max= Pd_max = 0.2 * SOC_max
+Pc_min = Pd_min = 0.2 * SOC_min
+G = 4
+T = 24
+VWC = 50
+Pg_min = np.array([28, 20, 30, 20])
+Pg_max = np.array([200, 290, 190, 260])
+RU = np.array([40, 30, 30, 50])
+RD = np.array([40, 30, 30, 50])
+
+Load = np.array([510, 530, 516, 510, 515, 544, 646, 686, 741, 734, 748, 760, 754, 700, 686, 720, 714, 761, 727, 714, 618, 584, 578, 544])
+Wind = np.array([44.1, 48.5, 65.7, 144.9, 202.3, 317.3, 364.4, 317.3, 271, 306.9, 424.1, 398, 487.6, 521.9, 541.3, 560, 486.8, 372.6, 367.4, 314.3, 316.6, 311.4, 405.4, 470.4])
+
+#变量索引
+nPg = G * T
+nSOC = T
+nPd = T
+nPc = T
+nPw = T
+n_var = G * T + 5 * T
+#利用词典分配索引
+var_index = {}
+i = 0;
+var_index['Pg'] = i#先T循环后G循环
+i+= nPg
+
+var_index['SOC'] = i
+i+= nSOC
+
+var_index['Pd'] = i
+i+= nPd
+
+var_index['Pc'] = i
+i+= nPc
+
+var_index['Pw'] = i
+i+= nPw
+
+var_index['Pwc'] = i
+#建立变量
+var = np.ones(n_var)
+start = var_index['Pg']
+for g in range(G):
+    Pg = start + g * T
+    var[Pg:Pg+T] = 0.5 * (Pg_max[g] + Pg_min[g])
+start = var_index['SOC']
+var[start:start+T] = 0.5 * (SOC_max + SOC_min)
+start = var_index['Pd']
+var[start:start+T] = 0.5 * (Pd_max + Pd_min)
+start = var_index['Pc']
+var[start:start+T] = 0.5 * (Pc_max + Pc_min)
+start = var_index['Pw']
+var[start:start+T] = 0.5 * Wind
+start = var_index['Pwc']
+var[start:start+T] = 0.5 * Wind
+#统计约束条件数量
+n_ub = G * T * 3  + T * 3 - 2 * G
+n_lb = G * T + T * 3
+n_ineq = n_ub + n_lb
+n_eq = T * 3 + 1
+
+#松弛变量与拉格朗日乘子
+l = np.ones(n_lb) #下限松弛变量
+L = diags(l)
+z = np.ones(n_lb) #下限拉格朗日乘子
+Z = diags(z)
+u = np.ones(n_ub) #上限松弛变量
+U = diags(u)
+w = np.ones(n_ub) #上限拉格朗日乘子
+W = diags(w)
+y = np.zeros(n_eq) #等式约束拉格朗日乘子
+
+#上限约束索引
+ub_index = {}
+i = 0
+ub_index['Pgmax'] = i
+i+= nPg
+ub_index['SOCmax'] = i
+i+= nSOC
+ub_index['Pdmax'] = i
+i+= nPd
+ub_index['Pcmax'] = i
+i+= nPc
+ub_index['Rampup'] = i
+i+= G * (T-1)
+ub_index['Rampdown'] = i
+i+= G * (T-1)
+#下限约束索引
+lb_index = {}
+i = 0
+lb_index['Pgmin'] = i
+i+= nPg
+lb_index['SOCmin'] = i
+i+= nSOC
+lb_index['Pdmin'] = i
+i+= nPd
+lb_index['Pcmin'] = i
+i+= nPc
+#等式约束索引
+eq_index = {}
+i = 0
+eq_index['SOC0'] = i
+i+= 1
+eq_index['SOCt'] = i
+i+= T - 1
+eq_index['SOCini'] = i
+i+= 1
+eq_index['Load_balance'] = i
+i+= T
+eq_index['Wind_balance'] = i
+i+= T
+#求7-72矩阵中各个元素
+#先求H
+H = lil_matrix((n_var, n_var))
+start_row = var_index['Pg']
+start_col = var_index['Pg']
+for g in range (G):
+    for t in range (T):
+        row = start_row + t
+        col = start_col + t
+        H[row, col] = -2 * a[g]
+    start_row += T
+    start_col += T
+##然后求等式约束的梯度g（x），这里书本中默认转置了一下
+nabla_eq =  lil_matrix((n_eq, n_var))
+#等式约束SOC0
+nabla_eq[eq_index['SOC0'], var_index['SOC']] = 1.0
+nabla_eq[eq_index['SOC0'], var_index['Pc']] = -eta_c
+nabla_eq[eq_index['SOC0'], var_index['Pd']] = 1/eta_d
+#等式约束SOCt
+start_row = eq_index['SOCt']
+start_col = var_index['SOC']
+for t in range (1,T):
+    row = start_row + t - 1
+    col = start_col + t - 1
+    nabla_eq[row, col] = -1
+    nabla_eq[row, col+1] = 1
+
+start_row = eq_index['SOCt']
+start_col = var_index['Pc']
+for t in range (1,T):
+    row = start_row + t - 1
+    col = start_col + t
+    nabla_eq[row, col] = -eta_c
+
+start_row = eq_index['SOCt']
+start_col = var_index['Pd']
+for t in range (1,T):
+    row = start_row + t - 1
+    col = start_col + t
+    nabla_eq[row, col] = 1/eta_d
+
+#等式约束SOC24
+start_row = eq_index['SOCini']
+start_col = var_index['SOC']
+row = start_row
+col = start_col + T - 1
+nabla_eq[row, col] = 1
+
+#等式约束Load balance
+start_row = eq_index['Load_balance']
+start_col = var_index['Pw']
+for t in range (T):
+    row = start_row + t
+    col = start_col + t
+    nabla_eq[row, col] = 1
+
+start_row = eq_index['Load_balance']
+start_col = var_index['Pg']
+for t in range (T):
+    for g in range (G):
+        row = start_row + t
+        col = start_col + t + g * T
+        nabla_eq[row, col] = 1
+
+start_row = eq_index['Load_balance']
+start_col = var_index['Pd']
+for t in range (T):
+    row = start_row + t
+    col = start_col + t
+    nabla_eq[row, col] = 1
+
+start_row = eq_index['Load_balance']
+start_col = var_index['Pc']
+for t in range (T):
+    row = start_row + t
+    col = start_col + t
+    nabla_eq[row, col] = -1
+
+#等式约束Wind_balance
+start_row = eq_index['Wind_balance']
+start_col = var_index['Pw']
+for t in range (T):
+    row = start_row + t
+    col = start_col + t
+    nabla_eq[row, col] = 1
+
+start_row = eq_index['Wind_balance']
+start_col = var_index['Pwc']
+for t in range (T):
+    row = start_row + t
+    col = start_col + t
+    nabla_eq[row, col] = 1
+
+
+##不等式约束
+nabla_ub =  lil_matrix((n_ub, n_var))
+nabla_lb =  lil_matrix((n_lb, n_var))
+#上限约束Pgmax
+start_row = ub_index['Pgmax']
+start_col =var_index['Pg']
+for g in range (G):
+    for t in range (T):
+        row = start_row + t
+        col = start_col + t
+        nabla_ub[row, col] = 1
+    start_row += T
+    start_col += T
+
+
+#上限约束SOCmax
+start_row = ub_index['SOCmax']
+start_col = var_index['SOC']
+for t in range (T):
+    row = start_row + t
+    col = start_col + t
+    nabla_ub[row, col] = 1
+
+#上限约束Pdmax
+start_row = ub_index['Pdmax']
+start_col = var_index['Pd']
+for t in range (T):
+    row = start_row + t
+    col = start_col + t
+    nabla_ub[row, col] = 1
+
+#上限约束Pcmax
+start_row = ub_index['Pcmax']
+start_col = var_index['Pc']
+for t in range (T):
+    row = start_row + t
+    col = start_col + t
+    nabla_ub[row, col] = 1
+
+#上限约束Rampup
+start_row = ub_index['Rampup']
+start_col = var_index['Pg']
+for g in range (G):
+    for t in range (1,T):
+        row = start_row + t - 1
+        col = start_col + t
+        nabla_ub[row, col] = 1
+        nabla_ub[row, col-1] = -1
+    start_row += T - 1
+    start_col += T
+
+#上线约束Rampdown
+start_row = ub_index['Rampdown']
+start_col = var_index['Pg']
+for g in range (G):
+    for t in range (1,T):
+        row = start_row + t - 1
+        col = start_col + t
+        nabla_ub[row, col] = -1
+        nabla_ub[row, col - 1] = 1
+    start_row += T - 1
+    start_col += T
+
+#下限约束Pgmin
+start_row = lb_index['Pgmin']
+start_col = var_index['Pg']
+for g in range (G):
+    for t in range (T):
+        row = start_row + t
+        col = start_col + t
+        nabla_lb[row, col] = 1
+    start_row += T
+    start_col += T
+
+#下限约束SOCmin
+start_row = lb_index['SOCmin']
+start_col = var_index['SOC']
+for t in range (T):
+    row = start_row + t
+    col = start_col + t
+    nabla_lb[row, col] = 1
+
+#下限约束Pdmin
+start_row = lb_index['Pdmin']
+start_col = var_index['Pd']
+for t in range (T):
+    row = start_row + t
+    col = start_col + t
+    nabla_lb[row, col] = 1
+
+#下限约束Pcmin
+start_row = lb_index['Pcmin']
+start_col = var_index['Pc']
+for t in range (T):
+    row = start_row + t
+    col = start_col + t
+    nabla_lb[row, col] = 1
+
+#将ub、lb合成 不等式约束nabla_ineq
+nabla_ineq = lil_matrix((n_ineq, n_var))
+nabla_ineq = vstack([nabla_ub, nabla_lb])
+
+#将分块矩阵按照7-72拼接为一个大矩阵LHS
+I_lb = eye(n_lb)
+I_ub = eye(n_ub)
+LHS = lil_matrix((n_var+n_eq+2*(n_ub+n_lb),n_var+n_eq+2*(n_ub+n_lb)))
+O = None
+LHS = bmat([[H,nabla_eq.T,nabla_lb.T,nabla_ub.T,O,O],
+           [nabla_eq,O,O,O,O,O],
+           [nabla_lb,O,O,O,-I_lb,O],
+           [nabla_ub,O,O,O,O,I_ub],
+           [O,O,L,O,Z,O],
+           [O,O,O,U,O,W]]
+           )
+
+#下面根据7-56~61定义7-72中的右侧矩阵RHS
+def calculate_rhs_gap(var, y, z, w, l, u, 
+                                 n_var, n_eq, n_ineq,
+                                 a, b, VWC, G, T,
+                                 nabla_eq, nabla_lb, nabla_ub,
+                                 var_index, lb_index, ub_index,
+                                 SOC_ini, eta_c, eta_d,
+                                 Load, Wind,
+                                 Pg_min, SOC_min, Pd_min, Pc_min,
+                                 Pg_max, SOC_max, Pd_max, Pc_max,
+                                 RU, RD):
+#f(x)梯度nabla_obj
+    nabla_obj = np.ones(n_var)
+    start = var_index['Pg']
+    for g in range (G):
+        for t in range (T):
+            nabla_obj[start+t] = 2 * a[g] * var[start + t] + b[g]
+        start += T
+
+    start = var_index[('Pwc')]
+    for t in range (T):
+        nabla_obj[start+t] = VWC
+
+##  定义RHS
+#定义Lx 7-56
+    Lx = -nabla_obj + nabla_eq.T @ y + nabla_lb.T @ z + nabla_ub.T @ w
+
+#定义Ly 7-57
+    Ly = np.ones(n_eq)
+    Ly_SOC0 = var[var_index['SOC']] - SOC_ini - var[var_index['Pc']] * eta_c +var[var_index['Pd']] * 1/eta_d
+    Ly_SOCt = (var[var_index['SOC']+1:var_index['SOC']+T] - var[var_index['SOC']:var_index['SOC']+T-1]
+           - var[var_index['Pc']+1:var_index['Pc']+T] * eta_c +var[var_index['Pd']+1:var_index['Pd']+T] * 1/eta_d)
+    Ly_SOC24 = var[var_index['SOC']+T-1] - SOC_ini
+    Pg_t = var[var_index['Pg']:var_index['SOC']].reshape(G, T)
+    sum_pg = np.ones(T)
+    for t in range (T):
+        sum_pg_t = np.sum(Pg_t[:, t])
+        sum_pg[t] = sum_pg_t
+    Ly_demand_balance = (var[var_index['Pw']:var_index['Pw']+T] + sum_pg + var[var_index['Pd']:var_index['Pd']+T]
+                     - var[var_index['Pc']:var_index['Pc']+T] - Load)
+    Ly_wind_balance = var[var_index['Pw']:var_index['Pw']+T] + var[var_index['Pwc']:var_index['Pwc']+T] - Wind
+    Ly = np.concatenate([[Ly_SOC0], Ly_SOCt, [Ly_SOC24],Ly_demand_balance,Ly_wind_balance])#垂直拼接
+
+#定义Lz 7-58
+    lz_parts=[]
+    for g in range (G):
+        var_pg_g = var[var_index['Pg'] + g * T : var_index['Pg'] + (g + 1) * T]
+        l_pg_g = l[lb_index['Pgmin'] + g * T : lb_index['Pgmin'] + (g + 1) * T]
+        result_g = var_pg_g - l_pg_g - Pg_min[g]
+        lz_parts.append(result_g)
+        Lz_pgmin = np.concatenate(lz_parts)
+    Lz_SOCmin = var[var_index['SOC']:var_index['SOC']+T] - SOC_min - l[lb_index['SOCmin']:lb_index['Pdmin']]
+    Lz_Pdmin = var[var_index['Pd']:var_index['Pd']+T] - Pd_min - l[lb_index['Pdmin']:lb_index['Pcmin']]
+    Lz_Pcmin = var[var_index['Pc']:var_index['Pc']+T] - Pc_min - l[lb_index['Pcmin']:lb_index['Pcmin']+T]
+    Lz = np.concatenate([Lz_pgmin, Lz_SOCmin, Lz_Pdmin, Lz_Pcmin])
+
+#定义Lw 7-59
+    lw_parts = []
+
+# 2. 处理 Pgmax 约束部分 (G*T 个)
+    for g in range(G):
+        var_pg_g = var[var_index['Pg'] + g * T : var_index['Pg'] + (g + 1) * T]
+    # 动态切片 u
+        u_pg_g = u[ub_index['Pgmax'] + g * T : ub_index['Pgmax'] + (g + 1) * T]
+        pg_max_residual = var_pg_g + u_pg_g - Pg_max[g]
+        lw_parts.append(pg_max_residual)
+
+# 3. 处理 SOCmax, Pdmax, Pcmax 约束 (各 T 个)
+    u_soc_max = u[ub_index['SOCmax'] : ub_index['Pdmax']]
+    soc_max_residual = var[var_index['SOC'] : var_index['Pd']] + u_soc_max - SOC_max
+    lw_parts.append(soc_max_residual)
+    u_pd_max = u[ub_index['Pdmax'] : ub_index['Pcmax']]
+    pd_max_residual = var[var_index['Pd'] : var_index['Pc']] + u_pd_max - Pd_max
+    lw_parts.append(pd_max_residual)
+    u_pc_max = u[ub_index['Pcmax'] : ub_index['Rampup']]
+    pc_max_residual = var[var_index['Pc'] : var_index['Pw']] + u_pc_max - Pc_max
+    lw_parts.append(pc_max_residual)
+
+
+# 4. 处理 Rampup 和 Rampdown 约束 (核心修正部分)
+    for g in range(G):
+    # (a) Rampup (爬坡) 部分
+        pg_g = var[var_index['Pg'] + g * T : var_index['Pg'] + (g + 1) * T]
+    # ramp_up_diff 的尺寸是 (23,)
+        ramp_up_diff = pg_g[1:] - pg_g[:-1]
+    # 动态切片 u，使其尺寸也为 (23,)
+        u_ramp_up_g = u[ub_index['Rampup'] + g * (T-1) : ub_index['Rampup'] + (g + 1) * (T-1)]
+        ramp_up_residual = ramp_up_diff + u_ramp_up_g - RU[g]
+        lw_parts.append(ramp_up_residual)
+
+    # (b) Rampdown (滑坡) 部分
+    # ramp_down_diff 的尺寸是 (23,)
+        ramp_down_diff = pg_g[:-1] - pg_g[1:]
+    # 动态切片 u，使其尺寸也为 (23,)
+        u_ramp_down_g = u[ub_index['Rampdown'] + g * (T-1) : ub_index['Rampdown'] + (g + 1) * (T-1)]
+        ramp_down_residual = ramp_down_diff + u_ramp_down_g - RD[g]
+        lw_parts.append(ramp_down_residual)
+
+# 5. 将所有部分一次性拼接成完整的 Lw 向量
+    Lw = np.concatenate(lw_parts)
+#定义对偶间隙Gap、扰动因子mu
+    Gap = l.dot(z) + u.dot(w)
+    mu = 0.1 * Gap / (2*n_ineq)
+#定义Lmu_l 7-60
+    Lmu_l = l*z - mu
+#定义Lmu_u 7-61
+    Lmu_u = u*w + mu
+#定义RHS
+    RHS = np.concatenate([Lx, -Ly,-Lz,-Lw,-Lmu_l,-Lmu_u])
+    return RHS,Gap
+
+RHS,Gap = calculate_rhs_gap(var, y, z, w, l, u, 
+                                 n_var, n_eq, n_ineq,
+                                 a, b, VWC, G, T,
+                                 nabla_eq, nabla_lb, nabla_ub,
+                                 var_index, lb_index, ub_index,
+                                 SOC_ini, eta_c, eta_d,
+                                 Load, Wind,
+                                 Pg_min, SOC_min, Pd_min, Pc_min,
+                                 Pg_max, SOC_max, Pd_max, Pc_max,
+                                 RU, RD)
+#先按当前初期迭代一次计算修正量
+delta = spsolve(LHS.tocsc(), RHS) # 求解线性方程组 LHS * delta = RHS
+iteration = np.concatenate([var,y,z,w,l,u])
+iteration = delta + iteration
+var = iteration[0:n_var]
+y = iteration[n_var:n_var + n_eq]
+z = iteration[n_var + n_eq:n_var + n_eq+ n_lb]
+w = iteration[n_var + n_eq+ n_lb:n_var + n_eq+ n_lb + n_ub]
+l = iteration[n_var + n_eq+ n_lb + n_ub:n_var + n_eq+ 2*n_lb + n_ub]
+u = iteration[n_var + n_eq+ 2*n_lb + n_ub:n_var + n_eq+ 2*n_lb+ 2*n_ub]
+L = diags(l)
+Z = diags(z)
+U = diags(u)
+W = diags(w)
+#主循环
+k = 1 #迭代次数
+SUM_PG = 0
+while Gap > 1e-6 and k < max_iter :
+    mu = 0.1 * Gap / (2*n_ineq)
+    delta = spsolve(LHS.tocsc(), RHS) # 求解线性方程组 LHS * delta = RHS
+    iteration = np.concatenate([var,y,z,w,l,u])
+    iteration = delta + iteration
+    var = iteration[0:n_var]
+    y = iteration[n_var:n_var + n_eq]
+    z = iteration[n_var + n_eq:n_var + n_eq+ n_lb]
+    w = iteration[n_var + n_eq+ n_lb:n_var + n_eq+ n_lb + n_ub]
+    l = iteration[n_var + n_eq+ n_lb + n_ub:n_var + n_eq+ 2*n_lb + n_ub]
+    u = iteration[n_var + n_eq+ 2*n_lb + n_ub:n_var + n_eq+ 2*n_lb + 2*n_ub]
+    L = diags(l)
+    Z = diags(z)
+    U = diags(u)
+    W = diags(w)
+    LHS = bmat([
+        [H, nabla_eq.T, nabla_lb.T, nabla_ub.T, None, None],
+        [nabla_eq, None, None, None, None, None],
+        [nabla_lb, None, None, None, -eye(n_lb), None],
+        [nabla_ub, None, None, None, None, eye(n_ub)],
+        [None, None, Z, None, L, None],
+        [None, None, None, W, None, U]
+    ])
+    RHS,Gap = calculate_rhs_gap(var, y, z, w, l, u, 
+                                 n_var, n_eq, n_ineq,
+                                 a, b, VWC, G, T,
+                                 nabla_eq, nabla_lb, nabla_ub,
+                                 var_index, lb_index, ub_index,
+                                 SOC_ini, eta_c, eta_d,
+                                 Load, Wind,
+                                 Pg_min, SOC_min, Pd_min, Pc_min,
+                                 Pg_max, SOC_max, Pd_max, Pc_max,
+                                 RU, RD)
+    k += 1
+if k >= max_iter:
+    print('已到达最大迭代次数')
+else:
+    #迭代结束，求目标值
+    for g in range(G):
+        PGT = (a[g] * var[var_index['Pg']+g*T:var_index['Pg']+(g+1)*T] ** 2 +  
+        b[g] * var[var_index['Pg']+g*T:var_index['Pg']+(g+1)*T] + c[g])
+        SUM_PG += np.sum(PGT)
+    SUM_VWC = np.sum(VWC * var[var_index['Pwc']:var_index['Pwc']+T])
+Obj = SUM_PG + SUM_VWC
+print(f"目标函数 = {Obj}\n")
+print(f"迭代次数 = {k}")
+
+import numpy as np
+from scipy.sparse import lil_matrix, diags, eye, bmat
+from scipy.sparse.linalg import spsolve
+
+# ===================================================================
+# 1. 参数设置
+# ===================================================================
+a = np.array([0.12, 0.17, 0.15, 0.19])
+b = np.array([14.8, 16.57, 15.55, 16.21])
+c = np.array([89, 83, 100, 70])
+max_iter = 100 # 适当增加迭代次数
+
+eta_c = 0.95
+eta_d = 0.9
+SOC_ini = 100
+SOC_max = 300
+SOC_min = 60
+Pc_max = Pd_max = 0.2 * SOC_max
+Pc_min = Pd_min = 0.2 * SOC_min
+G = 4
+T = 24
+VWC = 50
+Pg_min = np.array([28, 20, 30, 20])
+Pg_max = np.array([200, 290, 190, 260])
+RU = np.array([40, 30, 30, 50])
+RD = np.array([40, 30, 30, 50])
+
+Load = np.array([510, 530, 516, 510, 515, 544, 646, 686, 741, 734, 748, 760, 754, 700, 686, 720, 714, 761, 727, 714, 618, 584, 578, 544])
+Wind = np.array([44.1, 48.5, 65.7, 144.9, 202.3, 317.3, 364.4, 317.3, 271, 306.9, 424.1, 398, 487.6, 521.9, 541.3, 560, 486.8, 372.6, 367.4, 314.3, 316.6, 311.4, 405.4, 470.4])
+
+# ===================================================================
+# 2. 变量与约束定义
+# ===================================================================
+nPg = G * T
+nSOC = T
+nPd = T
+nPc = T
+nPw = T
+n_var = G * T + 4 * T
+
+var_index = {}
+i = 0
+var_index['Pg'] = i; i += nPg
+var_index['SOC'] = i; i += nSOC
+var_index['Pd'] = i; i += nPd
+var_index['Pc'] = i; i += nPc
+var_index['Pw'] = i; i += nPw
+
+n_ub = G * (T - 1) * 2 + G * T + T * 4
+n_lb = G * T + T * 4
+n_eq = T * 2
+n_ineq = n_ub + n_lb
+
+ub_index = {}
+i = 0
+ub_index['Pgmax'] = i; i += nPg
+ub_index['SOCmax'] = i; i += nSOC
+ub_index['Pdmax'] = i; i += nPd
+ub_index['Pcmax'] = i; i += nPc
+ub_index['Pwmax'] = i; i += T
+ub_index['Rampup'] = i; i += G * (T - 1)
+ub_index['Rampdown'] = i; i += G * (T - 1)
+
+lb_index = {}
+i = 0
+lb_index['Pgmin'] = i; i += nPg
+lb_index['SOCmin'] = i; i += nSOC
+lb_index['Pdmin'] = i; i += nPd
+lb_index['Pcmin'] = i; i += nPc
+lb_index['Pwmin'] = i; i += T
+
+eq_index = {}
+i = 0
+eq_index['SOC0'] = i; i += 1
+eq_index['SOCt'] = i; i += T - 1
+eq_index['Load_balance'] = i; i += T
+
+# ===================================================================
+# 3. 初始化变量与乘子
+# ===================================================================
+var = np.zeros(n_var)
+start = var_index['Pg']
+for g in range(G):
+    var[start + g * T:start + (g + 1) * T] = 0.5 * (Pg_max[g] + Pg_min[g])
+var[var_index['SOC']:var_index['Pd']] = 0.5 * (SOC_max + SOC_min)
+var[var_index['Pd']:var_index['Pc']] = 0.5 * (Pd_max + Pd_min)
+var[var_index['Pc']:var_index['Pw']] = 0.5 * (Pc_max + Pc_min)
+var[var_index['Pw']:] = 0.5 * Wind
+
+l = np.ones(n_lb); z = np.ones(n_lb)
+u = np.ones(n_ub); w = np.ones(n_ub)
+y = np.zeros(n_eq)
+
+# ===================================================================
+# 4. 构建静态矩阵 (Hessian 和 Jacobians)
+# ===================================================================
+H = lil_matrix((n_var, n_var))
+start_row = var_index['Pg']
+for g in range(G):
+    for t in range(T):
+        row = start_row + t
+        col = start_row + t
+        # ##################################################
+        # ### 根本性错误修正：Hessian矩阵必须为正定 ###
+        # ### 对于最小化问题 a*x^2, 二阶导数为 +2*a ###
+        # ##################################################
+        H[row, col] = 2 * a[g]
+    start_row += T
+
+nabla_eq = lil_matrix((n_eq, n_var))
+nabla_ub = lil_matrix((n_ub, n_var))
+nabla_lb = lil_matrix((n_lb, n_var))
+
+# --- 填充 nabla_eq ---
+nabla_eq[eq_index['SOC0'], var_index['SOC']] = 1
+nabla_eq[eq_index['SOC0'], var_index['Pc']] = -eta_c
+nabla_eq[eq_index['SOC0'], var_index['Pd']] = 1 / eta_d
+for t in range(1, T):
+    row = eq_index['SOCt'] + t - 1
+    nabla_eq[row, var_index['SOC'] + t] = 1
+    nabla_eq[row, var_index['SOC'] + t - 1] = -1
+    nabla_eq[row, var_index['Pc'] + t] = -eta_c
+    nabla_eq[row, var_index['Pd'] + t] = 1 / eta_d
+for t in range(T):
+    row = eq_index['Load_balance'] + t
+    for g in range(G):
+        nabla_eq[row, var_index['Pg'] + g * T + t] = 1
+    nabla_eq[row, var_index['Pd'] + t] = 1
+    nabla_eq[row, var_index['Pc'] + t] = -1
+    nabla_eq[row, var_index['Pw'] + t] = 1
+
+# --- 填充 nabla_ub 和 nabla_lb ---
+for g in range(G): # Pg
+    for t in range(T):
+        idx = g*T+t
+        nabla_ub[ub_index['Pgmax']+idx, var_index['Pg']+idx] = 1
+        nabla_lb[lb_index['Pgmin']+idx, var_index['Pg']+idx] = 1
+for t in range(T): # SOC, Pd, Pc, Pw
+    nabla_ub[ub_index['SOCmax']+t, var_index['SOC']+t]=1; nabla_lb[lb_index['SOCmin']+t, var_index['SOC']+t]=1
+    nabla_ub[ub_index['Pdmax']+t, var_index['Pd']+t]=1;   nabla_lb[lb_index['Pdmin']+t, var_index['Pd']+t]=1
+    nabla_ub[ub_index['Pcmax']+t, var_index['Pc']+t]=1;   nabla_lb[lb_index['Pcmin']+t, var_index['Pc']+t]=1
+    nabla_ub[ub_index['Pwmax']+t, var_index['Pw']+t]=1;   nabla_lb[lb_index['Pwmin']+t, var_index['Pw']+t]=1
+for g in range(G): # Ramp
+    for t in range(1, T):
+        idx = g*(T-1) + (t-1)
+        var_t, var_t_1 = var_index['Pg']+g*T+t, var_index['Pg']+g*T+t-1
+        nabla_ub[ub_index['Rampup']+idx, var_t]=1; nabla_ub[ub_index['Rampup']+idx, var_t_1]=-1
+        nabla_ub[ub_index['Rampdown']+idx, var_t]=-1; nabla_ub[ub_index['Rampdown']+idx, var_t_1]=1
+
+I_lb = eye(n_lb); I_ub = eye(n_ub)
+
+# ===================================================================
+# 5. 辅助计算函数
+# ===================================================================
+def calculate_rhs_gap(var, y, z, w, l, u, params):
+    (a, b, VWC, G, T, Load, Wind, SOC_ini, eta_c, eta_d,
+     Pg_min, SOC_min, Pd_min, Pc_min,
+     Pg_max, SOC_max, Pd_max, Pc_max, RU, RD,
+     var_index, lb_index, ub_index,
+     nabla_eq, nabla_lb, nabla_ub, n_ineq) = params
+     
+    nabla_obj = np.zeros(n_var)
+    start = var_index['Pg']
+    for g in range(G):
+        for t in range(T):
+            nabla_obj[start + g*T + t] = 2 * a[g] * var[start + g*T + t] + b[g]
+    nabla_obj[var_index['Pw']:] = -VWC
+
+    Lx = nabla_obj + nabla_eq.T @ y + nabla_lb.T @ z + nabla_ub.T @ w
+    
+    Ly_SOC0 = var[var_index['SOC']] - SOC_ini - eta_c * var[var_index['Pc']] + (1/eta_d) * var[var_index['Pd']]
+    Ly_SOCt = (var[var_index['SOC']+1:var_index['Pd']] - var[var_index['SOC']:var_index['Pd']-1] -
+               eta_c * var[var_index['Pc']+1:var_index['Pw']] + (1/eta_d) * var[var_index['Pd']+1:var_index['Pc']])
+    Pg_t = var[var_index['Pg']:var_index['SOC']].reshape(G, T)
+    sum_pg_t = np.sum(Pg_t, axis=0)
+    Ly_demand = (sum_pg_t + var[var_index['Pw']:] + var[var_index['Pd']:var_index['Pc']] -
+                 var[var_index['Pc']:var_index['Pw']] - Load)
+    Ly = np.concatenate([[Ly_SOC0], Ly_SOCt, Ly_demand])
+
+    lz_parts = []
+    for g in range(G):
+        lz_parts.append(var[var_index['Pg']+g*T:var_index['Pg']+(g+1)*T] - l[lb_index['Pgmin']+g*T:lb_index['Pgmin']+(g+1)*T] - Pg_min[g])
+    lz_parts.append(var[var_index['SOC']:var_index['Pd']] - l[lb_index['SOCmin']:lb_index['Pdmin']] - SOC_min)
+    lz_parts.append(var[var_index['Pd']:var_index['Pc']] - l[lb_index['Pdmin']:lb_index['Pcmin']] - Pd_min)
+    lz_parts.append(var[var_index['Pc']:var_index['Pw']] - l[lb_index['Pcmin']:lb_index['Pwmin']] - Pc_min)
+    lz_parts.append(var[var_index['Pw']:] - l[lb_index['Pwmin']:] - 0)
+    Lz = np.concatenate(lz_parts)
+    
+    lw_parts = []
+    for g in range(G):
+        lw_parts.append(var[var_index['Pg']+g*T:var_index['Pg']+(g+1)*T] + u[ub_index['Pgmax']+g*T:ub_index['Pgmax']+(g+1)*T] - Pg_max[g])
+    lw_parts.append(var[var_index['SOC']:var_index['Pd']] + u[ub_index['SOCmax']:ub_index['Pdmax']] - SOC_max)
+    lw_parts.append(var[var_index['Pd']:var_index['Pc']] + u[ub_index['Pdmax']:ub_index['Pcmax']] - Pd_max)
+    lw_parts.append(var[var_index['Pc']:var_index['Pw']] + u[ub_index['Pcmax']:ub_index['Pwmax']] - Pc_max)
+    lw_parts.append(var[var_index['Pw']:] + u[ub_index['Pwmax']:ub_index['Rampup']] - Wind)
+    for g in range(G):
+        pg_g = var[var_index['Pg'] + g*T : var_index['Pg']+(g+1)*T]
+        u_ru_g = u[ub_index['Rampup']+g*(T-1) : ub_index['Rampup']+(g+1)*(T-1)]
+        u_rd_g = u[ub_index['Rampdown']+g*(T-1) : ub_index['Rampdown']+(g+1)*(T-1)]
+        lw_parts.append(pg_g[1:] - pg_g[:-1] + u_ru_g - RU[g])
+        lw_parts.append(pg_g[:-1] - pg_g[1:] + u_rd_g - RD[g])
+    Lw = np.concatenate(lw_parts)
+    
+    Gap = l.dot(z) + u.dot(w)
+    mu = 0.1 * Gap / n_ineq if n_ineq > 0 else 0
+    Lmu_l = l * z - mu
+    Lmu_u = u * w - mu
+    
+    RHS = -np.concatenate([Lx, Ly, Lz, Lw, Lmu_l, Lmu_u])
+    return RHS, Gap
+
+# ===================================================================
+# 6. 主循环
+# ===================================================================
+params = (a, b, VWC, G, T, Load, Wind, SOC_ini, eta_c, eta_d,
+          Pg_min, SOC_min, Pd_min, Pc_min,
+          Pg_max, SOC_max, Pd_max, Pc_max, RU, RD,
+          var_index, lb_index, ub_index,
+          nabla_eq, nabla_lb, nabla_ub, n_ineq)
+k = 1
+Gap = 1.0
+
+while Gap > 1e-6 and k <= max_iter:
+    L = diags(l); Z = diags(z); U = diags(u); W_mat = diags(w)
+    LHS = bmat([[H, nabla_eq.T, nabla_lb.T, nabla_ub.T, None, None],
+                [nabla_eq, None, None, None, None, None],
+                [nabla_lb, None, None, None, -I_lb, None],
+                [nabla_ub, None, None, None, None, I_ub],
+                [None, None, Z, None, L, None],
+                [None, None, None, W_mat, None, U]]).tocsc()
+    
+    RHS, Gap = calculate_rhs_and_gap(var, y, z, w, l, u, params)
+    print(f"Iteration: {k}, Gap: {Gap:.6e}")
+    if np.isnan(Gap): break
+
+    try:
+        delta = spsolve(LHS, RHS)
+    except Exception as e:
+        print(f"Solver failed at iteration {k}: {e}"); break
+
+    delta_x=delta[0:n_var]; delta_y=delta[n_var:n_var+n_eq]; delta_z=delta[n_var+n_eq:n_var+n_eq+n_lb]
+    delta_w=delta[n_var+n_eq+n_lb:n_var+n_eq+n_lb+n_ub]; delta_l=delta[n_var+n_eq+n_lb+n_ub:n_var+n_eq+2*n_lb+n_ub]
+    delta_u=delta[n_var+n_eq+2*n_lb+n_ub:]
+    
+    alpha_pri, alpha_dual = 1.0, 1.0
+    if np.any(delta_l<0): alpha_pri=min(alpha_pri, 0.99*np.min(-l[delta_l<0]/delta_l[delta_l<0]))
+    if np.any(delta_u<0): alpha_pri=min(alpha_pri, 0.99*np.min(-u[delta_u<0]/delta_u[delta_u<0]))
+    if np.any(delta_z<0): alpha_dual=min(alpha_dual, 0.99*np.min(-z[delta_z<0]/delta_z[delta_z<0]))
+    if np.any(delta_w<0): alpha_dual=min(alpha_dual, 0.99*np.min(-w[delta_w<0]/delta_w[delta_w<0]))
+
+    var+=alpha_pri*delta_x; l+=alpha_pri*delta_l; u+=alpha_pri*delta_u
+    y+=alpha_dual*delta_y; z+=alpha_dual*delta_z; w+=alpha_dual*delta_w
+    k += 1
+
+# ===================================================================
+# 7. 结果输出
+# ===================================================================
+print("-" * 30)
+if k > max_iter and Gap > 1e-6: print(f'Result: Did not converge after {max_iter} iterations.')
+elif np.isnan(Gap): print(f'Result: Calculation diverged (nan). Check model definition.')
+else: print(f'Result: Converged successfully!')
+
+SUM_PG = 0
+for g in range(G):
+    pg_optimal = var[var_index['Pg']+g*T:var_index['Pg']+(g+1)*T]
+    PGT = np.sum(a[g] * pg_optimal**2 + b[g] * pg_optimal + c[g])
+    SUM_PG += PGT
+
+Pw_optimal = var[var_index['Pw']:]
+Pwc_optimal = Wind - Pw_optimal
+SUM_VWC = np.sum(VWC * Pwc_optimal)
+Obj = SUM_PG + SUM_VWC
+
+print(f"Iterations: {k-1}"); print(f"Final Gap: {Gap:.6e}"); print(f"Final Objective: {Obj:.2f}")
+
+
